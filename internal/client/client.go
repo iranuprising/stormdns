@@ -634,3 +634,16 @@ func (c *Client) HandleErrorDrop(packet VpnProto.Packet) error {
 func (c *Client) HandleMTUResponse(packet VpnProto.Packet) error {
 	return nil
 }
+
+func (c *Client) SetMinValidResolvers(n int) {
+	if c.balancer != nil {
+		c.balancer.SetMinValidResolvers(n)
+	}
+}
+
+func (c *Client) GetTrafficStats() map[string]uint64 {
+	return map[string]uint64{
+		"bytesOut": c.txTotalBytes.Load(),
+		"bytesIn":  c.rxTotalBytes.Load(),
+	}
+}
