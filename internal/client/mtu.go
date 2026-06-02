@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -76,12 +76,83 @@ func (c *Client) RunInitialMTUTests(ctx context.Context) error {
 	if len(c.connections) == 0 {
 		return ErrNoValidConnections
 	}
-	return c.runFullMTUTests(ctx)
+
+	c.mtuTotal.Store(int32(len(c.connections)))
+	c.mtuCompleted.Store(0)
+	c.mtuValid.Store(0)
+	c.mtuRejected.Store(0)
+	uploadCaps := c.precomputeUploadCaps()
+	workerCount := min(max(1, c.cfg.MTUTestParallelism), len(c.connections))
+	c.logMTUStart(workerCount)
+	for idx := range c.connections {
+		c.prepareConnectionMTUScanState(&c.connections[idx])
+	}
+
+	counters := &mtuScanCounters{}
+
+	// Start workers in a background goroutine!
+	go func() {
+		c.runAllMTUProbeWorkers(ctx, uploadCaps, workerCount, counters, func(conn Connection) {
+			c.balancer.RefreshValidConnections()
+			c.reoptimizeOnBackgroundResolverFound()
+		})
+	}()
+
+	// Wait until at least targetValid (configured or default to 2) valid resolver is found,
+	// or all connections are probed, or context is done.
+	targetValid := 2
+	if c.MinValidResolvers > 0 {
+		targetValid = c.MinValidResolvers
+	}
+	if len(c.connections) < targetValid {
+		targetValid = len(c.connections)
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if c.mtuValid.Load() >= int32(targetValid) {
+			break
+		}
+		if c.mtuCompleted.Load() == int32(len(c.connections)) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	c.balancer.RefreshValidConnections()
+	validConns, minUpload, minDownload, minUploadChars := summarizeValidMTUConnections(c.connections)
+	if len(validConns) == 0 {
+		if c.log != nil {
+			c.log.Errorf("<red>No valid connections found after MTU testing!</red>")
+		}
+		return ErrNoValidConnections
+	}
+
+	c.applySyncedMTUState(minUpload, minDownload, minUploadChars)
+	c.initResolverRecheckMeta()
+	c.logMTUCompletion(validConns)
+	return nil
+}
+
+func (c *Client) reoptimizeOnBackgroundResolverFound() {
+	c.resolverConnsMu.Lock()
+	defer c.resolverConnsMu.Unlock()
+
+	validConns, minUpload, minDownload, minUploadChars := summarizeValidMTUConnections(c.connections)
+	if len(validConns) > 0 {
+		c.applySyncedMTUState(minUpload, minDownload, minUploadChars)
+	}
 }
 
 // runFullMTUTests performs the original fully-sequential blocking MTU scan and
 // blocks until every connection has been probed before returning.
 func (c *Client) runFullMTUTests(ctx context.Context) error {
+	c.mtuTotal.Store(int32(len(c.connections)))
+	c.mtuCompleted.Store(0)
+	c.mtuValid.Store(0)
+	c.mtuRejected.Store(0)
 	uploadCaps := c.precomputeUploadCaps()
 	workerCount := min(max(1, c.cfg.MTUTestParallelism), len(c.connections))
 	c.logMTUStart(workerCount)
@@ -168,7 +239,9 @@ func (c *Client) prepareConnectionMTUScanState(conn *Connection) {
 		return
 	}
 	conn.IsValid = false
+	conn.Tested = false
 	conn.UploadMTUBytes = 0
+
 	conn.UploadMTUChars = 0
 	conn.DownloadMTUBytes = 0
 	conn.MTUResolveTime = 0
@@ -180,8 +253,12 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			c.mtuCompleted.Add(1)
+			c.mtuRejected.Add(1)
 			conn.IsValid = false
+			conn.Tested = true
 			if c.log != nil {
+
 				c.log.Errorf(
 					"💥 <red>MTU Probe Worker Panic: <cyan>%v</cyan> (Resolver: <cyan>%s</cyan>)</red>",
 					recovered,
@@ -193,14 +270,15 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 				rejectedNow := counters.rejectUpload.Add(1) + counters.rejectDownload.Load()
 				if c.log != nil && c.log.Enabled(logger.LevelWarn) {
 					c.log.Warnf(
-						"<red>❌ Rejected (%d/%d): <cyan>%s</cyan> via <cyan>%s</cyan> | reason=<yellow>PANIC</yellow> | totals: valid=<green>%d</green>, rejected=<red>%d</red></red>",
+						"❌ Rejected (%d/%d): <cyan>%s</cyan> via <yellow>%s</yellow> | PANIC | valid=<green>%d</green>, rejected=<red>%d</red>",
 						completed,
 						total,
 						conn.Domain,
-						conn.ResolverLabel,
+						conn.Resolver,
 						counters.valid.Load(),
 						rejectedNow,
-					)
+						)
+
 				}
 			}
 		}
@@ -217,7 +295,24 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 	}
 
 	result, reason := c.probeConnectionMTU(ctx, conn, maxUploadPayload)
+	c.mtuCompleted.Add(1)
+	conn.Tested = true
+	if reason != mtuRejectNone {
+
+		c.mtuRejected.Add(1)
+	} else {
+		c.mtuValid.Add(1)
+	}
+
 	if counters == nil {
+		if reason == mtuRejectNone {
+			conn.IsValid = true
+			conn.UploadMTUBytes = result.UploadBytes
+			conn.UploadMTUChars = result.UploadChars
+			conn.DownloadMTUBytes = result.DownloadBytes
+			conn.MTUResolveTime = result.ResolveTime
+			c.appendResolverCacheEntry(conn)
+		}
 		return
 	}
 
@@ -227,15 +322,16 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 		rejectedNow := counters.rejectUpload.Add(1) + counters.rejectDownload.Load()
 		if c.log != nil && c.log.Enabled(logger.LevelWarn) {
 			c.log.Warnf(
-				"<red>❌ Rejected (%d/%d): <cyan>%s</cyan> via <cyan>%s</cyan> | reason=<yellow>UPLOAD_MTU</yellow> | value=<cyan>%d</cyan> | totals: valid=<green>%d</green>, rejected=<red>%d</red></red>",
-				completed,
-				total,
-				conn.Domain,
-				conn.ResolverLabel,
-				result.UploadBytes,
-				counters.valid.Load(),
-				rejectedNow,
+			        "❌ Rejected (%d/%d): <cyan>%s</cyan> via <yellow>%s</yellow> | UPLOAD_MTU (<cyan>%d</cyan>) | valid=<green>%d</green>, rejected=<red>%d</red>",
+			        completed,
+			        total,
+			        conn.Domain,
+			        conn.Resolver,
+			        result.UploadBytes,
+			        counters.valid.Load(),
+			        rejectedNow,
 			)
+
 		}
 		return
 	case mtuRejectDownload:
@@ -243,15 +339,16 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 		rejectedNow := counters.rejectUpload.Load() + counters.rejectDownload.Add(1)
 		if c.log != nil && c.log.Enabled(logger.LevelWarn) {
 			c.log.Warnf(
-				"<red>❌ Rejected (%d/%d): <cyan>%s</cyan> via <cyan>%s</cyan> | reason=<yellow>DOWNLOAD_MTU</yellow> | value=<cyan>%d</cyan> | totals: valid=<green>%d</green>, rejected=<red>%d</red></red>",
-				completed,
-				total,
-				conn.Domain,
-				conn.ResolverLabel,
-				result.DownloadBytes,
-				counters.valid.Load(),
-				rejectedNow,
+			        "❌ Rejected (%d/%d): <cyan>%s</cyan> via <yellow>%s</yellow> | DOWNLOAD_MTU (<cyan>%d</cyan>) | valid=<green>%d</green>, rejected=<red>%d</red>",
+			        completed,
+			        total,
+			        conn.Domain,
+			        conn.Resolver,
+			        result.DownloadBytes,
+			        counters.valid.Load(),
+			        rejectedNow,
 			)
+
 		}
 		return
 	}

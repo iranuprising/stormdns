@@ -1,4 +1,4 @@
-﻿// ==============================================================================
+// ==============================================================================
 // StormDNS
 // Author: nullroute1970
 // Github: https://github.com/nullroute1970/StormDNS
@@ -304,6 +304,51 @@ func loadClientConfigFile(filename string) (ClientConfig, error) {
 	return cfg, nil
 }
 
+func loadClientConfigString(content string) (ClientConfig, error) {
+	cfg := defaultClientConfig()
+	meta, err := toml.Decode(content, &cfg)
+	if err != nil {
+		return cfg, fmt.Errorf("parse TOML content failed: %w", err)
+	}
+
+	cfg.ConfigPath = ""
+	cfg.ConfigDir = ""
+	cfg.ResolversFilePath = ""
+	cfg.explicitRX_TX_Workers = meta.IsDefined("RX_TX_WORKERS")
+	return cfg, nil
+}
+
+func LoadClientConfigWithString(content string, overrides ClientConfigOverrides) (ClientConfig, error) {
+	cfg, err := loadClientConfigString(content)
+	if err != nil {
+		return cfg, err
+	}
+
+	if overrides.ResolversFilePath != nil {
+		cfg.ResolversFilePath = strings.TrimSpace(*overrides.ResolversFilePath)
+	}
+	if len(overrides.Values) > 0 {
+	        if err := applyClientConfigOverrideValues(&cfg, overrides.Values); err != nil {
+	                return cfg, err
+	        }
+	}
+
+	if len(overrides.Resolvers) > 0 {
+	        cfg.Resolvers = overrides.Resolvers
+	        rm := make(map[string]int, len(overrides.Resolvers))
+	        for _, r := range overrides.Resolvers {
+	                rm[r.IP] = r.Port
+	        }
+	        cfg.ResolverMap = rm
+	}
+
+	cfg, err = finalizeClientConfig(cfg)
+	if err != nil {
+	        return cfg, err
+	}
+
+	return cfg, nil
+}
 func LoadClientConfigWithOverrides(filename string, overrides ClientConfigOverrides) (ClientConfig, error) {
 	cfg, err := loadClientConfigFile(filename)
 	if err != nil {
@@ -314,37 +359,34 @@ func LoadClientConfigWithOverrides(filename string, overrides ClientConfigOverri
 		cfg.ResolversFilePath = strings.TrimSpace(*overrides.ResolversFilePath)
 	}
 	if len(overrides.Values) > 0 {
-		if err := applyClientConfigOverrideValues(&cfg, overrides.Values); err != nil {
-			return cfg, err
-		}
+	        if err := applyClientConfigOverrideValues(&cfg, overrides.Values); err != nil {
+	                return cfg, err
+	        }
+	}
+
+	if len(overrides.Resolvers) > 0 {
+	        cfg.Resolvers = overrides.Resolvers
+	        rm := make(map[string]int, len(overrides.Resolvers))
+	        for _, r := range overrides.Resolvers {
+	                rm[r.IP] = r.Port
+	        }
+	        cfg.ResolverMap = rm
 	}
 
 	cfg, err = finalizeClientConfig(cfg)
 	if err != nil {
-		return cfg, err
-	}
-
-	// When explicit resolvers are provided (e.g. from log-based startup), override the
-	// file-loaded ones after finalization so the rest of the config is still validated.
-	if len(overrides.Resolvers) > 0 {
-		cfg.Resolvers = overrides.Resolvers
-		rm := make(map[string]int, len(overrides.Resolvers))
-		for _, r := range overrides.Resolvers {
-			rm[r.IP] = r.Port
-		}
-		cfg.ResolverMap = rm
+	        return cfg, err
 	}
 
 	return cfg, nil
-}
+	}
 
-func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
+	func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 	cfg.ProtocolType = strings.ToUpper(strings.TrimSpace(cfg.ProtocolType))
 	cfg.LogLevel = strings.TrimSpace(cfg.LogLevel)
 	if cfg.LogLevel == "" {
-		cfg.LogLevel = "INFO"
+	        cfg.LogLevel = "INFO"
 	}
-
 	switch cfg.ProtocolType {
 	case "", "SOCKS5":
 		cfg.ProtocolType = "SOCKS5"
@@ -527,16 +569,19 @@ func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 
 	cfg.ResolversFilePath = strings.TrimSpace(cfg.ResolversFilePath)
 
-	resolvers, resolverMap, err := LoadClientResolvers(cfg.ResolversPath())
-	if err != nil {
-		return cfg, err
+	if len(cfg.Resolvers) == 0 {
+	        resolvers, resolverMap, err := LoadClientResolvers(cfg.ResolversPath())
+	        if err != nil {
+	                return cfg, err
+	        }
+	        cfg.Resolvers = resolvers
+	        cfg.ResolverMap = resolverMap
 	}
-	cfg.Resolvers = resolvers
-	cfg.ResolverMap = resolverMap
 	return cfg, nil
 }
 
-func (c ClientConfig) ResolversPath() string {
+	func (c ClientConfig) ResolversPath() string {
+
 	if c.ResolversFilePath != "" {
 		if filepath.IsAbs(c.ResolversFilePath) {
 			return c.ResolversFilePath
