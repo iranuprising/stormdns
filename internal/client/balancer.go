@@ -750,3 +750,4 @@ func xorshift64(v uint64) uint64 {
 	v ^= v << 17
 	return v
 }
+func (b *Balancer) SetMinValidResolvers(n int) {}

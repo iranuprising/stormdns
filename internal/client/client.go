@@ -102,6 +102,11 @@ type Client struct {
 	// Traffic byte counters (per-session, reset on resetRuntimeBindings)
 	txTotalBytes atomic.Uint64
 	rxTotalBytes atomic.Uint64
+	mtuTotal atomic.Int32
+	mtuCompleted atomic.Int32
+	mtuValid atomic.Int32
+	mtuRejected atomic.Int32
+	MinValidResolvers int
 
 	// Async Runtime Workers & Channels
 	asyncWG              sync.WaitGroup
@@ -196,6 +201,7 @@ type Connection struct {
 	ResolverLabel    string
 	Key              string
 	IsValid          bool
+	Tested           bool
 	UploadMTUBytes   int
 	UploadMTUChars   int
 	DownloadMTUBytes int
