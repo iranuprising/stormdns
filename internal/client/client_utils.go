@@ -570,9 +570,11 @@ func (c *Client) BuildConnectionMap() error {
 	domains := c.cfg.Domains
 	resolvers := c.cfg.Resolvers
 
+	c.log.Infof("[client] BuildConnectionMap: domains=%d, resolvers=%d", len(domains), len(resolvers))
+
 	total := len(domains) * len(resolvers)
 	if total <= 0 {
-		return fmt.Errorf("Domains or Resolvers are missing in config.")
+		return fmt.Errorf("Domains or Resolvers are missing in config (domains: %d, resolvers: %d).", len(domains), len(resolvers))
 	}
 
 	connections := make([]Connection, 0, total)

@@ -570,12 +570,20 @@ func LoadClientConfigWithOverrides(filename string, overrides ClientConfigOverri
 	cfg.ResolversFilePath = strings.TrimSpace(cfg.ResolversFilePath)
 
 	if len(cfg.Resolvers) == 0 {
-	        resolvers, resolverMap, err := LoadClientResolvers(cfg.ResolversPath())
-	        if err != nil {
-	                return cfg, err
-	        }
-	        cfg.Resolvers = resolvers
-	        cfg.ResolverMap = resolverMap
+		// Only try to load from file if no resolvers were provided via overrides
+		resolversPath := cfg.ResolversPath()
+		// Check if file exists to avoid unnecessary error logging in some environments
+		if _, err := os.Stat(resolversPath); err == nil {
+			resolvers, resolverMap, err := LoadClientResolvers(resolversPath)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.Resolvers = resolvers
+			cfg.ResolverMap = resolverMap
+		} else {
+			// If no overrides and no default file, we can't start
+			return cfg, fmt.Errorf("no resolvers configured and default file not found at %s", resolversPath)
+		}
 	}
 	return cfg, nil
 }

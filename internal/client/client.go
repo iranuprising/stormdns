@@ -34,6 +34,56 @@ const (
 	EDnsSafeUDPSize = 4096
 )
 
+type Connection struct {
+	Domain           string
+	Resolver         string
+	ResolverPort     int
+	ResolverLabel    string
+	Key              string
+	IsValid          bool
+	Tested           bool
+	UploadMTUBytes   int
+	UploadMTUChars   int
+	DownloadMTUBytes int
+	MTUResolveTime   time.Duration
+}
+
+type clientStreamTXPacket struct {
+	PacketType      uint8
+	SequenceNum     uint16
+	FragmentID      uint8
+	TotalFragments  uint8
+	CompressionType uint8
+	Payload         []byte
+	CreatedAt       time.Time
+	TTL             time.Duration
+	RetryCount      int
+	Scheduled       bool
+}
+
+type rawOutboundTask struct {
+	packetType uint8
+	payload    []byte
+	opts       VpnProto.BuildOptions
+	wasPacked  bool
+	item       *clientStreamTXPacket
+	selected   *Stream_client
+	conns      []Connection
+}
+
+type encodedOutboundDatagram struct {
+	addr      *net.UDPAddr
+	serverKey string
+	packet    []byte
+}
+
+type encodedOutboundTask struct {
+	wasPacked bool
+	item      *clientStreamTXPacket
+	selected  *Stream_client
+	frames    []encodedOutboundDatagram
+}
+
 type Client struct {
 	cfg      config.ClientConfig
 	log      *logger.Logger
@@ -152,62 +202,6 @@ type Client struct {
 	socksRateLimit *socksRateLimiter
 }
 
-// clientStreamTXPacket represents a queued packet pending transmission or retransmission.
-type clientStreamTXPacket struct {
-	PacketType      uint8
-	SequenceNum     uint16
-	FragmentID      uint8
-	TotalFragments  uint8
-	CompressionType uint8
-	Payload         []byte
-	CreatedAt       time.Time
-	TTL             time.Duration
-	LastSentAt      time.Time
-	RetryDelay      time.Duration
-	RetryAt         time.Time
-	RetryCount      int
-	Scheduled       bool
-}
-
-// rawOutboundTask holds payload and stream information for parallel packet encoding.
-type rawOutboundTask struct {
-	packetType uint8
-	payload    []byte
-	opts       VpnProto.BuildOptions
-	wasPacked  bool
-	item       *clientStreamTXPacket
-	selected   *Stream_client
-	conns      []Connection
-}
-
-type encodedOutboundDatagram struct {
-	addr      *net.UDPAddr
-	serverKey string
-	packet    []byte
-}
-
-type encodedOutboundTask struct {
-	wasPacked bool
-	item      *clientStreamTXPacket
-	selected  *Stream_client
-	frames    []encodedOutboundDatagram
-}
-
-// Connection represents a unique domain-resolver pair with its associated metadata and MTU states.
-type Connection struct {
-	Domain           string
-	Resolver         string
-	ResolverPort     int
-	ResolverLabel    string
-	Key              string
-	IsValid          bool
-	Tested           bool
-	UploadMTUBytes   int
-	UploadMTUChars   int
-	DownloadMTUBytes int
-	MTUResolveTime   time.Duration
-}
-
 // Bootstrap initializes a new Client by loading configuration, setting up logging,
 // and preparing the connection map.
 func Bootstrap(configPath string, overrides config.ClientConfigOverrides) (*Client, error) {
@@ -215,6 +209,10 @@ func Bootstrap(configPath string, overrides config.ClientConfigOverrides) (*Clie
 	if err != nil {
 		return nil, err
 	}
+	return BootstrapLoadedConfig(cfg)
+}
+
+func BootstrapLoadedConfig(cfg config.ClientConfig) (*Client, error) {
 	cfg.ApplyStartupModeMTU("resolvers")
 
 	log := logger.New("StormDNS Client", cfg.LogLevel)
@@ -641,15 +639,59 @@ func (c *Client) HandleMTUResponse(packet VpnProto.Packet) error {
 	return nil
 }
 
-func (c *Client) SetMinValidResolvers(n int) {
-	if c.balancer != nil {
-		c.balancer.SetMinValidResolvers(n)
-	}
-}
-
 func (c *Client) GetTrafficStats() map[string]uint64 {
 	return map[string]uint64{
 		"bytesOut": c.txTotalBytes.Load(),
 		"bytesIn":  c.rxTotalBytes.Load(),
+	}
+}
+
+func (c *Client) GetMtuStats() (total, completed, valid, rejected int) {
+	return int(c.mtuTotal.Load()), int(c.mtuCompleted.Load()), int(c.mtuValid.Load()), int(c.mtuRejected.Load())
+}
+
+func (c *Client) GetValidResolvers() []string {
+	if c.balancer == nil {
+		return nil
+	}
+	snap := c.balancer.snapshot.Load()
+	if snap == nil {
+		return nil
+	}
+	var res []string
+	for _, idx := range snap.valid {
+		if idx < len(snap.connections) {
+			res = append(res, snap.connections[idx].ResolverLabel)
+		}
+	}
+	return res
+}
+
+func (c *Client) GetRejectedResolvers() []string {
+	if c.balancer == nil {
+		return nil
+	}
+	snap := c.balancer.snapshot.Load()
+	if snap == nil {
+		return nil
+	}
+	// Rejected are those in connections but NOT in valid list
+	validMap := make(map[int]struct{})
+	for _, idx := range snap.valid {
+		validMap[idx] = struct{}{}
+	}
+	var res []string
+	for i, conn := range snap.connections {
+		if _, ok := validMap[i]; !ok && conn.Tested {
+			res = append(res, conn.ResolverLabel)
+		}
+	}
+	return res
+}
+
+func (c *Client) SetMinValidResolvers(n int) {
+	c.MinValidResolvers = n
+	if c.balancer != nil {
+		c.balancer.SetMinValidResolvers(n)
 	}
 }

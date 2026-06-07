@@ -10,10 +10,10 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net/netip"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -46,11 +46,20 @@ func LoadClientResolvers(filename string) ([]ResolverAddress, map[string]int, er
 	}
 	defer file.Close()
 
+	return ParseClientResolversFromReader(file)
+}
+
+func ParseClientResolversString(content string) ([]ResolverAddress, map[string]int, error) {
+	return ParseClientResolversFromReader(strings.NewReader(content))
+}
+
+func ParseClientResolversFromReader(r io.Reader) ([]ResolverAddress, map[string]int, error) {
 	endpoints := make([]ResolverAddress, 0, 64)
 	resolverMap := make(map[string]int, 64)
 	seenIPs := make(map[string]struct{}, 64)
 
-	scanner := bufio.NewScanner(file)
+	fmt.Printf("[config] ParseClientResolversFromReader starting\n")
+	scanner := bufio.NewScanner(r)
 	lineNum := 0
 	for scanner.Scan() {
 		lineNum++
@@ -78,19 +87,9 @@ func LoadClientResolvers(filename string) ([]ResolverAddress, map[string]int, er
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, nil, fmt.Errorf("failed to read resolver file %s: %w", path, err)
+		return nil, nil, fmt.Errorf("failed to read resolvers: %w", err)
 	}
-	if len(endpoints) == 0 {
-		return nil, nil, fmt.Errorf("no valid resolvers found in %s", path)
-	}
-
-	sort.Slice(endpoints, func(i, j int) bool {
-		if endpoints[i].IP == endpoints[j].IP {
-			return endpoints[i].Port < endpoints[j].Port
-		}
-		return endpoints[i].IP < endpoints[j].IP
-	})
-
+	fmt.Printf("[config] Finished parsing, found %d resolvers\n", len(endpoints))
 	return endpoints, resolverMap, nil
 }
 
